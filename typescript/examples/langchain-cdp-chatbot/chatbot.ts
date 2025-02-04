@@ -16,51 +16,67 @@ import { ChatOpenAI } from "@langchain/openai";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as readline from "readline";
+import { customActionProvider } from "@coinbase/agentkit";
+import { z } from "zod";
 
 dotenv.config();
 
 /**
- * Validates that required environment variables are set
- *
- * @throws {Error} - If required environment variables are missing
- * @returns {void}
+ * Validates that required environment variables are set.
  */
 function validateEnvironment(): void {
   const missingVars: string[] = [];
-
-  // Check required variables
   const requiredVars = ["OPENAI_API_KEY", "CDP_API_KEY_NAME", "CDP_API_KEY_PRIVATE_KEY"];
-  requiredVars.forEach(varName => {
+  requiredVars.forEach((varName) => {
     if (!process.env[varName]) {
       missingVars.push(varName);
     }
   });
-
-  // Exit if any required variables are missing
   if (missingVars.length > 0) {
     console.error("Error: Required environment variables are not set");
-    missingVars.forEach(varName => {
+    missingVars.forEach((varName) => {
       console.error(`${varName}=your_${varName.toLowerCase()}_here`);
     });
     process.exit(1);
   }
-
-  // Warn about optional NETWORK_ID
   if (!process.env.NETWORK_ID) {
     console.warn("Warning: NETWORK_ID not set, defaulting to base-sepolia testnet");
   }
 }
 
-// Add this right after imports and before any other code
 validateEnvironment();
 
-// Configure a file to persist the agent's CDP MPC Wallet Data
 const WALLET_DATA_FILE = "wallet_data.txt";
 
 /**
- * Initialize the agent with CDP Agentkit
- *
- * @returns Agent executor and config
+ * Define a custom action to get Ether balance using the BaseScan API.
+ */
+const customGetBalance = customActionProvider({
+  name: "get_balance",
+  description: "Retrieve Ether balance for a given Ethereum address using BaseScan API",
+  schema: z.object({
+    address: z.string().describe("The Ethereum address to check balance for"),
+  }),
+  invoke: async (_walletProvider, args: any) => {
+    const { address } = args;
+    const apiKey = process.env.BASESCAN_API_KEY; // Replace with your actual BaseScan API key
+    const url = `https://api.basescan.org/api?module=account&action=balance&address=${address}&tag=latest&apikey=${apiKey}`;
+    try {
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status !== "1") {
+        throw new Error(`Error from BaseScan: ${data.message}`);
+      }
+      const balanceWei = data.result;
+      return `The balance for address ${address} is ${balanceWei} wei.`;
+    } catch (error) {
+      return `Failed to retrieve balance: ${(error as Error).message}`;
+    }
+  },
+});
+
+/**
+ * Initialize the agent with CDP AgentKit.
  */
 async function initializeAgent() {
   try {
@@ -70,18 +86,14 @@ async function initializeAgent() {
     });
 
     let walletDataStr: string | null = null;
-
-    // Read existing wallet data if available
     if (fs.existsSync(WALLET_DATA_FILE)) {
       try {
         walletDataStr = fs.readFileSync(WALLET_DATA_FILE, "utf8");
       } catch (error) {
         console.error("Error reading wallet data:", error);
-        // Continue without wallet data
       }
     }
 
-    // Configure CDP Wallet Provider
     const config = {
       apiKeyName: process.env.CDP_API_KEY_NAME,
       apiKeyPrivateKey: process.env.CDP_API_KEY_PRIVATE_KEY?.replace(/\\n/g, "\n"),
@@ -91,7 +103,7 @@ async function initializeAgent() {
 
     const walletProvider = await CdpWalletProvider.configureWithWallet(config);
 
-    // Initialize AgentKit
+    // Create AgentKit instance including the custom action.
     const agentkit = await AgentKit.from({
       walletProvider,
       actionProviders: [
@@ -107,64 +119,54 @@ async function initializeAgent() {
           apiKeyName: process.env.CDP_API_KEY_NAME,
           apiKeyPrivateKey: process.env.CDP_API_KEY_PRIVATE_KEY?.replace(/\\n/g, "\n"),
         }),
+        customGetBalance, // Integrate custom action here.
       ],
     });
 
     const tools = await getLangChainTools(agentkit);
-
-    // Store buffered conversation history in memory
     const memory = new MemorySaver();
     const agentConfig = { configurable: { thread_id: "CDP AgentKit Chatbot Example!" } };
 
-    // Create React Agent using the LLM and CDP AgentKit tools
     const agent = createReactAgent({
       llm,
       tools,
       checkpointSaver: memory,
       messageModifier: `
-        You are a helpful agent that can interact onchain using the Coinbase Developer Platform AgentKit. You are 
-        empowered to interact onchain using your tools. If you ever need funds, you can request them from the 
-        faucet if you are on network ID 'base-sepolia'. If not, you can provide your wallet details and request 
+        You are a helpful agent that can interact onchain using the Coinbase Developer Platform AgentKit.
+        You are empowered to interact onchain using your tools. If you ever need funds, you can request them 
+        from the faucet if you are on network ID 'base-sepolia'. If not, you can provide your wallet details and request 
         funds from the user. Before executing your first action, get the wallet details to see what network 
         you're on. If there is a 5XX (internal) HTTP error code, ask the user to try again later. If someone 
         asks you to do something you can't do with your currently available tools, you must say so, and 
-        encourage them to implement it themselves using the CDP SDK + Agentkit, recommend they go to 
-        docs.cdp.coinbase.com for more information. Be concise and helpful with your responses. Refrain from 
-        restating your tools' descriptions unless it is explicitly requested.
-        `,
+        encourage them to implement it themselves using the CDP SDK + Agentkit. Be concise and helpful with your responses.
+      `,
     });
 
-    // Save wallet data
     const exportedWallet = await walletProvider.exportWallet();
     fs.writeFileSync(WALLET_DATA_FILE, JSON.stringify(exportedWallet));
 
     return { agent, config: agentConfig };
   } catch (error) {
     console.error("Failed to initialize agent:", error);
-    throw error; // Re-throw to be handled by caller
+    throw error;
   }
 }
 
 /**
- * Run the agent autonomously with specified intervals
+ * Run the agent autonomously at specified intervals.
  *
- * @param agent - The agent executor
- * @param config - Agent configuration
- * @param interval - Time interval between actions in seconds
+ * @param agent - The agent executor.
+ * @param config - Agent configuration.
+ * @param interval - Time interval between actions in seconds.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function runAutonomousMode(agent: any, config: any, interval = 10) {
   console.log("Starting autonomous mode...");
-
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       const thought =
         "Be creative and do something interesting on the blockchain. " +
         "Choose an action or set of actions and execute it that highlights your abilities.";
-
       const stream = await agent.stream({ messages: [new HumanMessage(thought)] }, config);
-
       for await (const chunk of stream) {
         if ("agent" in chunk) {
           console.log(chunk.agent.messages[0].content);
@@ -173,8 +175,7 @@ async function runAutonomousMode(agent: any, config: any, interval = 10) {
         }
         console.log("-------------------");
       }
-
-      await new Promise(resolve => setTimeout(resolve, interval * 1000));
+      await new Promise((resolve) => setTimeout(resolve, interval * 1000));
     } catch (error) {
       if (error instanceof Error) {
         console.error("Error:", error.message);
@@ -185,34 +186,26 @@ async function runAutonomousMode(agent: any, config: any, interval = 10) {
 }
 
 /**
- * Run the agent interactively based on user input
+ * Run the agent interactively based on user input.
  *
- * @param agent - The agent executor
- * @param config - Agent configuration
+ * @param agent - The agent executor.
+ * @param config - Agent configuration.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function runChatMode(agent: any, config: any) {
   console.log("Starting chat mode... Type 'exit' to end.");
-
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
-
   const question = (prompt: string): Promise<string> =>
-    new Promise(resolve => rl.question(prompt, resolve));
-
+    new Promise((resolve) => rl.question(prompt, resolve));
   try {
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const userInput = await question("\nPrompt: ");
-
       if (userInput.toLowerCase() === "exit") {
         break;
       }
-
       const stream = await agent.stream({ messages: [new HumanMessage(userInput)] }, config);
-
       for await (const chunk of stream) {
         if ("agent" in chunk) {
           console.log(chunk.agent.messages[0].content);
@@ -233,29 +226,24 @@ async function runChatMode(agent: any, config: any) {
 }
 
 /**
- * Choose whether to run in autonomous or chat mode based on user input
+ * Prompt the user to choose between chat or autonomous mode.
  *
- * @returns Selected mode
+ * @returns "chat" or "auto" based on user choice.
  */
 async function chooseMode(): Promise<"chat" | "auto"> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
-
   const question = (prompt: string): Promise<string> =>
-    new Promise(resolve => rl.question(prompt, resolve));
-
-  // eslint-disable-next-line no-constant-condition
+    new Promise((resolve) => rl.question(prompt, resolve));
   while (true) {
     console.log("\nAvailable modes:");
     console.log("1. chat    - Interactive chat mode");
     console.log("2. auto    - Autonomous action mode");
-
     const choice = (await question("\nChoose a mode (enter number or name): "))
       .toLowerCase()
       .trim();
-
     if (choice === "1" || choice === "chat") {
       rl.close();
       return "chat";
@@ -268,13 +256,12 @@ async function chooseMode(): Promise<"chat" | "auto"> {
 }
 
 /**
- * Start the chatbot agent
+ * Start the chatbot agent.
  */
 async function main() {
   try {
     const { agent, config } = await initializeAgent();
     const mode = await chooseMode();
-
     if (mode === "chat") {
       await runChatMode(agent, config);
     } else {
@@ -290,7 +277,7 @@ async function main() {
 
 if (require.main === module) {
   console.log("Starting Agent...");
-  main().catch(error => {
+  main().catch((error) => {
     console.error("Fatal error:", error);
     process.exit(1);
   });
