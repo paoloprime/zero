@@ -18,6 +18,8 @@ import * as fs from "fs";
 import * as readline from "readline";
 import { customActionProvider } from "@coinbase/agentkit";
 import { z } from "zod";
+import { DallEAPIWrapper } from "@langchain/openai";
+
 
 dotenv.config();
 
@@ -75,6 +77,96 @@ const customGetBalance = customActionProvider({
   },
 });
 
+const customGetTokenTransfers = customActionProvider({
+  name: "get_token_transfers",
+  description:
+    "Retrieve ERC-20 token transfer events for an address (and optionally filter by a token contract) using the BaseScan API",
+  schema: z.object({
+    // If checking transfers from an address, specify the address.
+    address: z.string().optional().describe("The Ethereum address to check token transfers for"),
+    // If filtering by a specific token contract, specify the contract address.
+    contractaddress: z.string().optional().describe("Optional token contract address to filter transfers"),
+    // Optional paging and filtering parameters:
+    page: z.number().optional().default(1).describe("Page number for pagination"),
+    offset: z.number().optional().default(100).describe("Number of results per page"),
+    startblock: z.number().optional().default(0).describe("Starting block number for search"),
+    endblock: z.number().optional().default(27025780).describe("Ending block number for search"),
+    sort: z.string().optional().default("asc").describe("Sort order: 'asc' or 'desc'"),
+  }),
+  invoke: async (_walletProvider, args: any) => {
+    // Destructure parameters, using defaults if not provided.
+    const {
+      address,
+      contractaddress,
+      page = 1,
+      offset = 100,
+      startblock = 0,
+      endblock = 27025780,
+      sort = "asc",
+    } = args;
+    
+    const apiKey = process.env.BASESCAN_API_KEY; 
+
+    // Construct the URL using the provided parameters.
+    let url = `https://api.basescan.org/api?module=account&action=tokentx`;
+    if (address) {
+      url += `&address=${address}`;
+    }
+    if (contractaddress) {
+      url += `&contractaddress=${contractaddress}`;
+    }
+    url += `&page=${page}&offset=${offset}&startblock=${startblock}&endblock=${endblock}&sort=${sort}&apikey=${apiKey}`;
+
+    try {
+      const response = await fetch(url);
+      const data = await response.json();
+
+      // Check if the API response is successful.
+      if (data.status !== "1") {
+        throw new Error(`Error from BaseScan: ${data.message}`);
+      }
+      
+      // The result is expected to be an array of token transfer events.
+      const transfers = data.result;
+      return `Token transfer events: ${JSON.stringify(transfers)}`;
+    } catch (error) {
+      return `Failed to retrieve token transfers: ${(error as Error).message}`;
+    }
+  },
+});
+
+const nftMinterAction = customActionProvider({
+  name: "mint_erc721",
+  description: "Mint ERC721 NFT to specified address",
+  schema: z.object({
+    recipient: z.string().describe("Recipient wallet address"),
+    tokenURI: z.string().describe("IPFS URI for NFT metadata"),
+    contractAddress: z.string().describe("ERC721 contract address")
+  }),
+  invoke: async (walletProvider, args) => {
+    const erc721ABI = [
+      "function safeMint(address to, string memory uri) external"
+    ];
+
+    try {
+      const signer = await walletProvider.getSigner();
+      const contract = new ethers.Contract(args.contractAddress, erc721ABI, signer);
+      const tx = await contract.safeMint(args.recipient, args.tokenURI);
+      await tx.wait();
+      return `NFT minted successfully: ${tx.hash}`;
+    } catch (error) {
+      return `Minting failed: ${(error as Error).message}`;
+    }
+  }
+});
+
+const dallETool = new DallEAPIWrapper({
+  n: 1,
+  model: "dall-e-3",
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+
 /**
  * Initialize the agent with CDP AgentKit.
  */
@@ -119,17 +211,22 @@ async function initializeAgent() {
           apiKeyName: process.env.CDP_API_KEY_NAME,
           apiKeyPrivateKey: process.env.CDP_API_KEY_PRIVATE_KEY?.replace(/\\n/g, "\n"),
         }),
-        customGetBalance, // Integrate custom action here.
+        customGetBalance,
+        customGetTokenTransfers, // Integrate custom action here.
       ],
     });
 
     const tools = await getLangChainTools(agentkit);
+
+  
+    const allTools = [...tools, dallETool];
+
     const memory = new MemorySaver();
     const agentConfig = { configurable: { thread_id: "CDP AgentKit Chatbot Example!" } };
 
     const agent = createReactAgent({
       llm,
-      tools,
+      tools: allTools,
       checkpointSaver: memory,
       messageModifier: `
         You are a helpful agent that can interact onchain using the Coinbase Developer Platform AgentKit.
