@@ -19,6 +19,8 @@ import * as readline from "readline";
 import { customActionProvider } from "@coinbase/agentkit";
 import { z } from "zod";
 import { DallEAPIWrapper } from "@langchain/openai";
+import { erc721ActionProvider } from "@coinbase/agentkit";
+
 
 
 dotenv.config();
@@ -135,31 +137,6 @@ const customGetTokenTransfers = customActionProvider({
   },
 });
 
-const nftMinterAction = customActionProvider({
-  name: "mint_erc721",
-  description: "Mint ERC721 NFT to specified address",
-  schema: z.object({
-    recipient: z.string().describe("Recipient wallet address"),
-    tokenURI: z.string().describe("IPFS URI for NFT metadata"),
-    contractAddress: z.string().describe("ERC721 contract address")
-  }),
-  invoke: async (walletProvider, args) => {
-    const erc721ABI = [
-      "function safeMint(address to, string memory uri) external"
-    ];
-
-    try {
-      const signer = await walletProvider.getSigner();
-      const contract = new ethers.Contract(args.contractAddress, erc721ABI, signer);
-      const tx = await contract.safeMint(args.recipient, args.tokenURI);
-      await tx.wait();
-      return `NFT minted successfully: ${tx.hash}`;
-    } catch (error) {
-      return `Minting failed: ${(error as Error).message}`;
-    }
-  }
-});
-
 const dallETool = new DallEAPIWrapper({
   n: 1,
   model: "dall-e-3",
@@ -211,6 +188,7 @@ async function initializeAgent() {
           apiKeyName: process.env.CDP_API_KEY_NAME,
           apiKeyPrivateKey: process.env.CDP_API_KEY_PRIVATE_KEY?.replace(/\\n/g, "\n"),
         }),
+        erc721ActionProvider(),
         customGetBalance,
         customGetTokenTransfers, // Integrate custom action here.
       ],
